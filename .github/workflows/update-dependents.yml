@@ -1,0 +1,121 @@
+name: Update Dependent Repositories
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: # allows manual triggering
+
+jobs:
+  update-repos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Get latest commit hash
+        id: hash
+        run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Update dependent repositories
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e  # Exit on error
+          
+          # List of repos that use this action
+          REPOS=(
+            "annotell/kognic-ui"
+            "annotell/kognic-toast" 
+            "annotell/annotation-tool-guides"
+            "annotell/frontend-api-client"
+            "annotell/eslint-plugin"
+          )
+
+          LATEST_HASH="${{ steps.hash.outputs.sha }}"
+          ACTION_NAME="annotell/gha-npm-release"
+
+          # Validate hash format
+          if [[ ! "$LATEST_HASH" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "Error: Invalid commit hash format: $LATEST_HASH"
+            exit 1
+          fi
+
+          for repo in "${REPOS[@]}"; do
+            echo "Processing $repo..."
+            
+            # Validate repository name format
+            if [[ ! "$repo" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+              echo "Error: Invalid repository name format: $repo"
+              continue
+            fi
+            
+            # Clone the repo
+            if ! gh repo clone "$repo" "temp-$repo" -- --depth=1; then
+              echo "Error: Failed to clone repository: $repo"
+              continue
+            fi
+            
+            # Change to repo directory
+            repo_dir="temp-$(basename "$repo")"
+            if ! cd "$repo_dir"; then
+              echo "Error: Failed to enter directory: $repo_dir"
+              rm -rf "$repo_dir" 2>/dev/null || true
+              continue
+            fi
+            
+            # Create a new branch
+            BRANCH_NAME="update-action-$(date +%Y%m%d-%H%M%S)"
+            if ! git checkout -b "$BRANCH_NAME"; then
+              echo "Error: Failed to create branch $BRANCH_NAME in $repo"
+              cd ..
+              rm -rf "$repo_dir" 2>/dev/null || true
+              continue
+            fi
+            
+            # Find and replace the hash in workflow files
+            if find .github/workflows -name "*.yml" -o -name "*.yaml" | \
+               xargs grep -l "$ACTION_NAME@" | \
+               xargs sed -i "s|$ACTION_NAME@[a-f0-9]\{40\}|$ACTION_NAME@$LATEST_HASH|g"; then
+              
+              # Check if there are changes
+              if git diff --quiet; then
+                echo "No changes needed in $repo"
+              else
+                # Commit and push
+                git config user.name "github-actions[bot]"
+                git config user.email "github-actions[bot]@users.noreply.github.com"
+                git add .github/workflows/
+                
+                if ! git commit -m "Update $ACTION_NAME to $LATEST_HASH"; then
+                  echo "Error: Failed to commit changes in $repo"
+                  cd ..
+                  rm -rf "$repo_dir" 2>/dev/null || true
+                  continue
+                fi
+                
+                if ! git push origin "$BRANCH_NAME"; then
+                  echo "Error: Failed to push branch $BRANCH_NAME in $repo"
+                  cd ..
+                  rm -rf "$repo_dir" 2>/dev/null || true
+                  continue
+                fi
+                
+                # Create PR
+                if ! gh pr create \
+                  --title "Security update: Update $ACTION_NAME" \
+                  --body "Updates $ACTION_NAME to latest version: \`$LATEST_HASH\`
+
+                This is an automated update from the action repository." \
+                  --head "$BRANCH_NAME" \
+                  --repo "$repo"; then
+                  echo "Error: Failed to create PR in $repo"
+                else
+                  echo "Created PR for $repo"
+                fi
+              fi
+            else
+              echo "No workflow files found using $ACTION_NAME in $repo"
+            fi
+            
+            cd ..
+            rm -rf "$repo_dir" 2>/dev/null || true
+          done
