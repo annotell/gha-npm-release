@@ -1,0 +1,78 @@
+name: Update Dependent Repositories
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: # allows manual triggering
+
+jobs:
+  update-repos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Get latest commit hash
+        id: hash
+        run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Update dependent repositories
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # List of repos that use this action
+          REPOS=(
+            "annotell/kognic-ui"
+            "annotell/kognic-toast" 
+            "annotell/annotation-tool-guides"
+            "annotell/frontend-api-client"
+            "annotell/eslint-plugin"
+          )
+
+          LATEST_HASH="${{ steps.hash.outputs.sha }}"
+          ACTION_NAME="annotell/gha-npm-release"
+
+          for repo in "${REPOS[@]}"; do
+            echo "Processing $repo..."
+            
+            # Clone the repo
+            gh repo clone "$repo" "temp-$repo" -- --depth=1
+            cd "temp-$(basename $repo)"
+            
+            # Create a new branch
+            BRANCH_NAME="update-action-$(date +%Y%m%d-%H%M%S)"
+            git checkout -b "$BRANCH_NAME"
+            
+            # Find and replace the hash in workflow files
+            if find .github/workflows -name "*.yml" -o -name "*.yaml" | \
+               xargs grep -l "$ACTION_NAME@" | \
+               xargs sed -i "s|$ACTION_NAME@[a-f0-9]\{40\}|$ACTION_NAME@$LATEST_HASH|g"; then
+              
+              # Check if there are changes
+              if git diff --quiet; then
+                echo "No changes needed in $repo"
+              else
+                # Commit and push
+                git config user.name "github-actions[bot]"
+                git config user.email "github-actions[bot]@users.noreply.github.com"
+                git add .github/workflows/
+                git commit -m "Update $ACTION_NAME to $LATEST_HASH"
+                git push origin "$BRANCH_NAME"
+                
+                # Create PR
+                gh pr create \
+                  --title "Security update: Update $ACTION_NAME" \
+                  --body "Updates $ACTION_NAME to latest version: \`$LATEST_HASH\`
+
+                This is an automated update from the action repository." \
+                  --head "$BRANCH_NAME" \
+                  --repo "$repo"
+                
+                echo "Created PR for $repo"
+              fi
+            else
+              echo "No workflow files found using $ACTION_NAME in $repo"
+            fi
+            
+            cd ..
+            rm -rf "temp-$(basename $repo)"
+          done
