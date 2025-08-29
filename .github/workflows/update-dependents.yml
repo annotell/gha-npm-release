@@ -19,6 +19,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e  # Exit on error
+          
           # List of repos that use this action
           REPOS=(
             "annotell/kognic-ui"
@@ -31,16 +33,43 @@ jobs:
           LATEST_HASH="${{ steps.hash.outputs.sha }}"
           ACTION_NAME="annotell/gha-npm-release"
 
+          # Validate hash format
+          if [[ ! "$LATEST_HASH" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "Error: Invalid commit hash format: $LATEST_HASH"
+            exit 1
+          fi
+
           for repo in "${REPOS[@]}"; do
             echo "Processing $repo..."
             
+            # Validate repository name format
+            if [[ ! "$repo" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+              echo "Error: Invalid repository name format: $repo"
+              continue
+            fi
+            
             # Clone the repo
-            gh repo clone "$repo" "temp-$repo" -- --depth=1
-            cd "temp-$(basename $repo)"
+            if ! gh repo clone "$repo" "temp-$repo" -- --depth=1; then
+              echo "Error: Failed to clone repository: $repo"
+              continue
+            fi
+            
+            # Change to repo directory
+            repo_dir="temp-$(basename "$repo")"
+            if ! cd "$repo_dir"; then
+              echo "Error: Failed to enter directory: $repo_dir"
+              rm -rf "$repo_dir" 2>/dev/null || true
+              continue
+            fi
             
             # Create a new branch
             BRANCH_NAME="update-action-$(date +%Y%m%d-%H%M%S)"
-            git checkout -b "$BRANCH_NAME"
+            if ! git checkout -b "$BRANCH_NAME"; then
+              echo "Error: Failed to create branch $BRANCH_NAME in $repo"
+              cd ..
+              rm -rf "$repo_dir" 2>/dev/null || true
+              continue
+            fi
             
             # Find and replace the hash in workflow files
             if find .github/workflows -name "*.yml" -o -name "*.yaml" | \
@@ -55,24 +84,38 @@ jobs:
                 git config user.name "github-actions[bot]"
                 git config user.email "github-actions[bot]@users.noreply.github.com"
                 git add .github/workflows/
-                git commit -m "Update $ACTION_NAME to $LATEST_HASH"
-                git push origin "$BRANCH_NAME"
+                
+                if ! git commit -m "Update $ACTION_NAME to $LATEST_HASH"; then
+                  echo "Error: Failed to commit changes in $repo"
+                  cd ..
+                  rm -rf "$repo_dir" 2>/dev/null || true
+                  continue
+                fi
+                
+                if ! git push origin "$BRANCH_NAME"; then
+                  echo "Error: Failed to push branch $BRANCH_NAME in $repo"
+                  cd ..
+                  rm -rf "$repo_dir" 2>/dev/null || true
+                  continue
+                fi
                 
                 # Create PR
-                gh pr create \
+                if ! gh pr create \
                   --title "Security update: Update $ACTION_NAME" \
                   --body "Updates $ACTION_NAME to latest version: \`$LATEST_HASH\`
 
                 This is an automated update from the action repository." \
                   --head "$BRANCH_NAME" \
-                  --repo "$repo"
-                
-                echo "Created PR for $repo"
+                  --repo "$repo"; then
+                  echo "Error: Failed to create PR in $repo"
+                else
+                  echo "Created PR for $repo"
+                fi
               fi
             else
               echo "No workflow files found using $ACTION_NAME in $repo"
             fi
             
             cd ..
-            rm -rf "temp-$(basename $repo)"
+            rm -rf "$repo_dir" 2>/dev/null || true
           done
